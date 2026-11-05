@@ -1,0 +1,408 @@
+---
+title: "PRNODE in LICmethods: simulating, fitting and testing the inheritance of a mother-daughter pair"
+author: "Shirley Mathur and Kevin Lin"
+date: "2026-11-05"
+output:
+  html_document:
+    math_method:
+      engine: mathjax
+      url: "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-chtml-full.js"
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+knit: (function(input, ...) rmarkdown::render(input, output_dir = dirname(input), envir = globalenv()))
+vignette: >
+  %\VignetteIndexEntry{PRNODE in LICmethods: simulating, fitting and testing the inheritance of a mother-daughter pair}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5,
+                      fig.align = "center", comment = "#>")
+library(LICmethods)
+set.seed(1)
+```
+
+# Overview
+
+PRNODE jointly estimates the regulatory networks of a mother yeast cell and one of her daughters from live-cell
+imaging movies. Each cell's protein intensities follow a system of ordinary differential equations (ODEs) in which
+protein $k$ may regulate protein $j$; the mother's network is a shared **scaffold** plus a mother-specific
+**deviation**, and the daughter's is the same scaffold plus a daughter-specific deviation. A group lasso penalty
+decides which edges are shared, which are private to one cell, and which are absent. The pair's **inheritance**
+is then summarized by one number, the similarity of what the two fitted systems do to a state over one frame, and
+tested against wrong-mother pairings.
+
+This vignette shows the three things a user does with the package:
+
+| Task | Main functions | Section |
+|---|---|---|
+| a. simulate mother-daughter (MD) pairs, with a known truth | `sim_md_network()`, `build_md_dataset()`, `rewire_network()`, `md_truth_from_pars()` | 1 |
+| b. fit PRNODE to a pair | `fit_prnode()`, `score_md_networks()`, `plot_md_pair()`, `plot_md_adjacency()`, `plot_md_network()` | 2 |
+| c. estimate the pair's inheritance and test it by permuting the mother | `inheritance_flow()`, `inheritance_test()`, `plot_md_inheritance()` | 3 |
+
+The whole pipeline is four calls. Everything else in the package is called by one of them.
+
+```{r pipeline, eval = FALSE}
+ds <- build_md_dataset(seed = 1, num_d = 24, noise_level_ratio = 0.1, truth_args = list(p = 6))  # a. simulate
+fit <- fit_prnode(m_obs_time = ds$raw$m_obs_time, Y_M = ds$raw$Y_M,                              # b. fit
+                  d_obs_time = ds$raw$d_obs_time, Y_D = ds$raw$Y_D, times_e = ds$raw$times_e)
+tau_hat <- inheritance_flow(fit)                                                                 # c. inheritance
+test <- inheritance_test(ds$raw$m_obs_time, ds$raw$Y_M, ds$raw$d_obs_time, ds$raw$Y_D,
+                         null_mothers = other_mothers, fit = fit, times_e = ds$raw$times_e)      #    and its test
+```
+
+**Vocabulary.** A dataset from `build_md_dataset()` is `list(meta, raw, truth, public)`.
+
+- `raw` is what the experiment would give you: the observation times of the mother and the daughter
+  (`m_obs_time`, `d_obs_time`), the noisy intensities (`Y_M`, `Y_D`, one row per frame and one column per protein)
+  and the daughter's birth time.
+- `truth` exists only for simulated data: the networks, the coefficients, the noiseless trajectories, the noise
+  standard deviations and the true inheritance. It is used to draw and to score a fit, never by the fit itself.
+- `public` is the design that PRNODE builds from `raw` alone (integrated bases, stacked mother and daughter rows,
+  one common noise weight), at a fixed smoothing level `spar = 0.5`.
+- An edge is **shared** when it is in both cells' true networks and **private** to a cell when it is in that cell's
+  network only (`mother_only` or `daughter_only` in `truth$edge_type`).
+
+# Simulating mother-daughter pairs
+
+## The truth: a scaffold and two deviations
+
+`sim_md_network()` draws the two cells' networks. Off-diagonal edges come in **antisymmetric pairs**: positions
+$(j, k)$ and $(k, j)$ with coefficients $+m$ and $-m$, so each pair is a damped rotation of two proteins at
+angular frequency $m$. With the default `edge_magnitude = c(4*pi, 10*pi)` a pair completes two to five cycles over
+the movie. Every diagonal entry is a negative self-degradation rate, equal in both cells, so the mother is always
+stable. The edge types are `shared_equal`, `shared_unequal` (one cell's pair is scaled by a factor),
+`mother_only`, `daughter_only`, `absent` and `self`.
+
+```{r truth}
+truth <- sim_md_network(p = 6, q = 1, num_shared = 6, num_mother_only = 2, num_daughter_only = 2,
+                        frac_unequal = 0.5, seed_number = 3)
+truth$edge_type
+table(truth$edge_type[row(truth$edge_type) != col(truth$edge_type)])
+round(truth$m_ode_pars, 2)
+```
+
+The coefficient matrices are the scaffold plus a deviation per cell, exactly:
+
+```{r truth-identities}
+all.equal(truth$m_ode_pars, truth$s_pars + truth$m_delta)
+all.equal(truth$d_ode_pars, truth$s_pars + truth$d_delta)
+```
+
+`plot_md_adjacency()` draws a network as an image, equation $j$ on the rows and regulator $k$ on the columns, a
+filled cell where $k$ regulates $j$. The filled diagonal is the self-degradation, which is excluded from every
+score.
+
+```{r truth-plot, fig.height = 3.2}
+par(mfrow = c(1, 3), mar = c(4, 4, 2, 1))
+plot_md_adjacency(truth$s_network, main = "scaffold (shared)")
+plot_md_adjacency(truth$m_network, main = "mother")
+invisible(plot_md_adjacency(truth$d_network, main = "daughter"))
+```
+
+## From the truth to a dataset
+
+`build_md_dataset()` solves the ODEs, observes both cells and adds noise. The mother is observed at all
+`obs_time` frames; the daughter is born at the frame where her last `num_d` frames start, from the mother's
+noiseless state, and is observed to the end of the movie. `noise_level_ratio` sets the noise standard deviation of
+each protein relative to its signal. Either hand it the `truth` drawn above, or let it draw one itself from
+`truth_args` (arguments of `sim_md_network()`), seeded by `seed`.
+
+```{r dataset}
+obs_time <- seq(0, 1, length.out = 48)         # 48 frames, as in the real movies
+ds <- build_md_dataset(seed = 11, num_d = 24, noise_level_ratio = 0.1, truth = truth,
+                       obs_time = obs_time, steps_per_frame = 200, level = "ode")
+str(ds$meta)
+names(ds$raw); names(ds$truth); names(ds$public)
+```
+
+The `level` argument decides what `public` is built from: `"ode"` (the default) smooths the noisy observations,
+which is what happens on real data, and `"regression"` hands the design the true trajectories, which isolates the
+effect of smoothing. Noise is independent across frames by default (`noise = "ar1"` with `rho` makes it
+autocorrelated). The lower-level functions `sim_ode_trajectory()` (one cell's exact solution) and
+`sim_md_trajectory()` (the pair, with the daughter started at her birth) are what `build_md_dataset()` calls.
+
+`plot_md_pair()` draws one panel per protein: observed points and true trajectories (solid). Once a fit exists
+it adds the fitted trajectories (dashed). The mother is blue, the daughter red.
+
+```{r plot-pair, fig.height = 7}
+panels <- plot_md_pair(ds$raw, truth = ds$truth, times_e = ds$raw$times_e)
+```
+
+`plot_md_pca3d()` shows the pair as polylines in the three-component PCA space of any reference set of cells,
+light at the first frame and dark at the last, the daughter's birth as a large dot.
+
+```{r plot-pca, fig.height = 6}
+out <- plot_md_pca3d(list(ds$raw$Y_M, ds$raw$Y_D), list(ds$raw$m_obs_time, ds$raw$d_obs_time),
+                     birth_time = ds$raw$birth_time)
+```
+
+## Choosing how related the pair is
+
+The simulator does not take a target level of inheritance. A pair's relatedness is set **structurally**, by one of
+two knobs, and then **read off** the dataset as `truth$inheritance`, the flow-map similarity $\tau$ of the two true
+systems defined in Section 3 (`truth$inheritance_std` is the same number in the standardized units the estimate
+targets). $\tau$ is 1 for identical systems; two unrelated systems of the same density read a **chance level** of roughly
+0.2 to 0.5 (about 0.3 on average), not 0, so a "low inheritance" pair is one that reads at its wrong-mother null.
+
+**Knob 1, `deviation_scale`.** The daughter's coefficients become the scaffold plus `deviation_scale` times her own
+deviation, so 0 gives her the scaffold alone and larger values push her away from it.
+
+```{r level}
+scale_vec <- c(0, 0.5, 1, 2, 4, 16)
+tau_scale <- sapply(scale_vec, function(scale){
+  build_md_dataset(seed = 11, num_d = 24, noise_level_ratio = 0.1, truth = truth, obs_time = obs_time,
+                   steps_per_frame = 200, level = "ode", deviation_scale = scale)$truth$inheritance
+})
+round(stats::setNames(tau_scale, paste0("scale_", scale_vec)), 3)
+```
+
+The scale moves $\tau$ only downward from the default, and scale 0 is not a clone, because the scaffold is the
+mother minus her own private edges.
+
+**Knob 2, `rewire_network()`.** This edits the mother's network unit by unit (a unit is an antisymmetric pair):
+each unit is kept with probability `keep_prob`, a dropped unit is replaced by a fresh one at an empty position, and a
+kept unit is reweighted with probability `unequal_prob`. `md_truth_from_pars()` turns the mother's and the edited
+daughter's coefficient matrices into a truth that `build_md_dataset(truth = )` accepts. It reaches both ends,
+from a clone (`keep_prob = 1`, `unequal_prob = 0`) to an unrelated daughter at the mother's density (`keep_prob = 0`):
+
+```{r recipes}
+mother <- sim_md_network(p = 6, q = 1, num_shared = 8, num_mother_only = 0, num_daughter_only = 0,
+                         frac_unequal = 0, seed_number = 21)
+knobs <- list(high = list(keep_prob = 1, unequal_prob = 0.5),
+              low = list(keep_prob = 0.2, unequal_prob = 0.5))
+ds_knob <- lapply(knobs, function(k){
+  edit <- rewire_network(mother$m_ode_pars, keep_prob = k$keep_prob, unequal_prob = k$unequal_prob,
+                         flip_prob = 0, seed_number = 22)
+  build_md_dataset(seed = 23, num_d = 24, noise_level_ratio = 0.5, truth = md_truth_from_pars(mother$m_ode_pars, edit$pars),
+                   obs_time = obs_time, steps_per_frame = 200, level = "ode")
+})
+sapply(ds_knob, function(d) round(d$truth$inheritance, 3))
+```
+
+The mapping from `keep_prob` to $\tau$ is loose, because *which* units are dropped matters more than how many. A
+study should therefore report the realized `truth$inheritance` of its pairs rather than the knob's value.
+
+# Fitting PRNODE to a pair
+
+## One call: `fit_prnode()`
+
+`fit_prnode()` is the only fitting function a user calls. Given the raw frames of a mother and a daughter it builds
+the design, chooses the **smoothing level** `spar` and the **penalty** $\lambda$ from the data, and returns the fit at
+that one penalty. The choice is made by a known-variance BIC: the penalty path is fitted once, the supports along it
+are refit by least squares, and the value minimizing $\sum_j [\mathrm{RSS}_{j} + k_{j} \log n]$ is taken, jointly over
+four smoothing levels $\{0, 0.25, 0.5, 0.75\}$. The tuning is carried in `fit$tuning`.
+
+```{r fit}
+fit <- fit_prnode(m_obs_time = ds$raw$m_obs_time, Y_M = ds$raw$Y_M, d_obs_time = ds$raw$d_obs_time,
+                  Y_D = ds$raw$Y_D, times_e = ds$raw$times_e)
+print(fit)
+print(fit$tuning)
+```
+
+To fit **your own data** the input is the same four objects: the frame times of the mother (`m_obs_time`) and of
+the daughter (`d_obs_time`, a subset of the mother's clock starting at the daughter's birth), and the two
+`n x p` matrices of intensities (`Y_M`, `Y_D`) with the same $p$ proteins in the same column order. Nothing else
+is needed; `times_e` is an optional fine time grid for the integrals.
+
+```{r real-data, eval = FALSE}
+# m_obs_time: frame times of the mother (length n_M);  Y_M: n_M x p intensities
+# d_obs_time: frame times of the daughter (length n_D); Y_D: n_D x p intensities, same proteins as Y_M
+fit <- fit_prnode(m_obs_time = m_obs_time, Y_M = Y_M, d_obs_time = d_obs_time, Y_D = Y_D)
+```
+
+If you already have a design (`ds$public`, or the output of `make_prnode_design()`), `fit_prnode(public)` tunes only
+$\lambda$ at the design's smoothing level. Passing a numeric `lambda` (a value, a vector, or a
+`prnode_tuning` object) skips the tuning and fits there; a vector returns the whole path as one `prnode_fit`.
+
+## Reading the fit
+
+The estimated networks are logical matrices, equation $j$ on the rows and regulator $k$ on the columns, and the
+estimated coefficients (`m_ode_est`, `d_ode_est` and the scaffold `s_ode_est`) are in the units of the observed
+intensities. Internally each cell's coefficients are the scaffold plus that cell's deviation.
+
+```{r read-fit}
+c(lambda = fit$lambda, spar = fit$tuning$spar, active_groups = fit$tuning$k[fit$tuning$pick_idx])
+round(fit$d_ode_est, 2)                         # the daughter's estimated coefficient matrix
+fit$d_network_est                               # and her estimated network
+round(fit$s_ode_est, 2)                         # the shared scaffold
+```
+
+The criterion the tuning minimizes, and the number of active groups it counts, along the penalty path:
+
+```{r tune-plot, fig.height = 4}
+tuning <- fit$tuning
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+plot(tuning$lambda_path, tuning$criterion, log = "x", type = "l", lwd = 2, xlab = "lambda",
+     ylab = "known-variance BIC", main = "the criterion")
+points(tuning$lambda, tuning$criterion[tuning$pick_idx], pch = 17, col = "#B2182B", cex = 1.5)
+plot(tuning$lambda_path, tuning$k, log = "x", type = "s", lwd = 2, xlab = "lambda", ylab = "active groups",
+     main = "the support")
+points(tuning$lambda, tuning$k[tuning$pick_idx], pch = 17, col = "#B2182B", cex = 1.5)
+```
+
+The fit's `discount` reports, per regulator and cell, how much the joint penalty lowers the threshold for an edge
+the other cell already has: 0 is no borrowing and 1 is full borrowing. It depends on the design and the
+multipliers `mu = c(S = 1, M = 1, D = 1)` alone, so it is available on real data. A larger `mu` for the deviations
+makes a shared edge cheaper than two private ones, which helps recover shared edges and also lets an edge found in
+one cell leak into the other; the default $(1, 1, 1)$ is a fixed design constant and is not tuned.
+
+```{r discount}
+round(rbind(mother = fit$discount$M, daughter = fit$discount$D), 3)
+```
+
+## Looking at the fit
+
+`plot_md_pair(fit = )` overlays the fitted trajectories (dashed) on the observations; `plot_md_adjacency()` draws
+the networks as images, and `plot_md_network()` as graphs, where an arrow runs from regulator $k$ to protein $j$,
+green for an activating (positive) and purple for an inhibiting coefficient, with the width proportional to its size.
+
+```{r fitted, fig.height = 7}
+invisible(plot_md_pair(ds$raw, truth = ds$truth, fit = fit, times_e = ds$raw$times_e))
+```
+
+```{r networks, fig.height = 5.5}
+par(mfrow = c(2, 3), mar = c(4, 4, 2, 1))
+plot_md_adjacency(ds$truth$s_network, main = "scaffold, truth")
+plot_md_adjacency(ds$truth$m_network, main = "mother, truth")
+plot_md_adjacency(ds$truth$d_network, main = "daughter, truth")
+plot_md_adjacency(fit$s_network_est, main = "scaffold, estimate")
+plot_md_adjacency(fit$m_network_est, main = "mother, estimate")
+invisible(plot_md_adjacency(fit$d_network_est, main = "daughter, estimate"))
+```
+
+```{r network-graphs, fig.height = 4}
+width_max <- max(abs(c(ds$truth$m_ode_pars, ds$truth$d_ode_pars, fit$m_ode_est, fit$d_ode_est)))
+par(mfrow = c(1, 2), mar = c(1, 1, 2, 1))
+plot_md_network(ds$truth$d_ode_pars, main = "daughter, truth", width_max = width_max)
+invisible(plot_md_network(fit$d_ode_est, network = fit$d_network_est, main = "daughter, estimate",
+                          width_max = width_max))
+```
+
+## Scoring against the truth (simulation only)
+
+On simulated data `score_md_networks()` compares the estimated networks with the true ones. It returns the
+confusion counts by edge type, the Matthews correlation coefficient (MCC) and F1 of each network (the diagonal is
+excluded), and two rates that need the true edge types:
+
+- the **borrow rate** of a cell is the fraction of the true shared edges it recovers;
+- the **leak rate** of a cell is the fraction of the *other* cell's private edges that its estimate shows.
+
+A scalar MCC can hide a leak, which is why both rates are reported. On real data there is no known truth, so these
+are only available on simulated pairs.
+
+```{r score}
+sc <- score_md_networks(fit, ds$truth)
+sc$mcc
+rbind(borrow = sc$borrow_rate, leak = sc$leak_rate)
+sc$confusion$D
+```
+
+# Inheritance and the wrong-mother test
+
+## The flow-map similarity and its estimate
+
+The pair's **inheritance** is the similarity of what the two regulatory systems do to a state over one frame. At
+$q = 1$ the cell's ODE is $\dot x_c = \theta^{(c)}_0 + A^{(c)} x_c$ with $A^{(c)}$ its coefficient matrix. Over one
+sampling interval $h$ the network moves a state $x$ to $e^{hA^{(c)}} x$, so $e^{hA^{(c)}} - I$ is the displacement
+it produces in one frame, and
+
+$$
+\tau\big(A^{(M)}, A^{(D)}\big) = 1 - \frac{\big\| e^{h A^{(M)}} - e^{h A^{(D)}} \big\|_F}
+{\big\| e^{h A^{(M)}} - I \big\|_F + \big\| e^{h A^{(D)}} - I \big\|_F}
+$$
+
+(`flow_map_similarity()`), with $\tau = 1$ when both systems are empty. $\tau$ lies in $[0, 1]$ and equals 1 exactly
+when the two systems coincide. Each coefficient is weighted by its size, so an edge too weak to move the trajectory
+barely moves $\tau$. Two unrelated systems do not read 0 but a chance level of roughly 0.2 to 0.5, so the absence of inheritance
+is a value of $\tau$ at that chance level, which is why it is tested against wrong mothers rather than against zero.
+At $q > 1$ each cell's Jacobian is taken at its own mean observed state.
+
+`inheritance_flow()` estimates $\tau$ from a fitted pair: it plugs the two fitted coefficient matrices at the tuned
+penalty into the formula, in the standardized units the solver works in (each protein divided by its pooled
+standard deviation), with $h$ one sampling interval. `plot_md_inheritance()` draws the plug-in along the tuned
+penalty path, with the pick (dotted), the estimate (solid) and, on simulated data, the truth's value (dashed).
+
+```{r inheritance, fig.height = 4}
+h <- median(diff(obs_time))                      # one frame on the [0, 1] clock of the movie
+tau_true <- ds$truth$inheritance_std
+tau_hat <- inheritance_flow(fit)
+c(truth = tau_true, estimate = tau_hat)
+# the definition, on the true systems: unrelated systems and a clone
+other_truth <- sim_md_network(p = 6, q = 1, num_shared = 6, num_mother_only = 2, num_daughter_only = 2, seed_number = 7)
+c(unrelated = flow_map_similarity(ds$truth$m_ode_pars, other_truth$d_ode_pars, h = h),
+  clone = flow_map_similarity(ds$truth$m_ode_pars, ds$truth$m_ode_pars, h = h))
+flow_out <- plot_md_inheritance(fit, truth = ds$truth)
+```
+
+The truth's similarity is `r round(tau_true, 2)` and the estimate reads `r round(tau_hat, 2)`. Estimation noise
+compresses the estimate toward the middle of $[0, 1]$: a difference the fit has not admitted at the tuned penalty
+counts as no difference, and a difference fitted to noise counts as one. The estimate therefore ranks pairs well but
+is not calibrated to the scale of $\tau$, which is one reason the test below is based on ranks.
+
+## The wrong-mother permutation test
+
+Is the daughter's network inherited from her own mother rather than from any cell? `inheritance_test()` pairs the
+daughter with each of $K$ **wrong mothers**, fits every wrong pairing jointly by PRNODE exactly as the true pair is
+(including its own choice of smoothing level and penalty), and reads each fit by `inheritance_flow()` at its own
+pick, giving $\hat\tau_{(1)}, \dots, \hat\tau_{(K)}$. Under the null that the daughter's network is unrelated to which
+mother she is paired with, her true estimate is exchangeable with the wrong ones, so
+
+$$
+p = \frac{1 + \#\{ i : \hat\tau_{(i)} \ge \hat\tau \}}{1 + K}
+$$
+
+is an exact p-value at the resolution $1/(1 + K)$ (`inheritance_pvalue()` computes it from a vector of null
+estimates). The null must come from joint refits, because the scaffold of a joint fit is what the estimate reads;
+the chance level of a joint fit sits above that of two separately fitted systems.
+
+Here the wrong mothers are the mothers of five other simulated pairs, drawn with the same generator and other
+seeds. `null_mothers` is a list of `n_M x p` matrices observed on the true mother's frames. Passing the true pair's
+`fit` saves refitting it; wrong pairings are then fitted with the same settings as that fit, including the search
+over the smoothing level.
+
+```{r inheritance-test}
+other_mothers <- lapply(31:35, function(seed){
+  build_md_dataset(seed = seed, num_d = 24, noise_level_ratio = 0.1, truth_args = list(p = 6),
+                   obs_time = obs_time, steps_per_frame = 200, level = "ode")$raw$Y_M
+})
+test <- inheritance_test(ds$raw$m_obs_time, ds$raw$Y_M, ds$raw$d_obs_time, ds$raw$Y_D,
+                         null_mothers = other_mothers, fit = fit, times_e = ds$raw$times_e)
+print(test)
+round(c(estimate = test$estimate, test$null), 3)
+```
+
+The true pairing reads `r round(test$estimate, 2)` against wrong pairings of `r round(min(test$null), 2)` to
+`r round(max(test$null), 2)`, so the p-value is `r signif(test$p_value, 2)`,
+`r if(test$p_value <= 1/6 + 1e-9) "the smallest value five wrong mothers allow" else "not the smallest value five wrong mothers allow"`.
+
+**Practical notes.**
+
+- *Cost.* Each wrong pairing costs about four path fits, one per level of the smoothing grid. Setting
+  `design_args = list(spar = 0.5)` fixes the level, skips the search and cuts the cost to one fit per pairing; it must
+  then match the settings of the `fit` handed in, or `fit` can be left `NULL`.
+- *Number of wrong mothers.* The smallest attainable p-value is $1/(1 + K)$, so use $K$ large enough for the
+  significance level you need ($K = 19$ for 0.05). On real data the wrong mothers are the other mothers in the same
+  movie. Each must be observed on the same frames as the true mother, or be given as a list with its own `Y_M` and
+  `m_obs_time`.
+- *Interpretation.* A small p-value says the daughter's network is closer to her own mother's than to a random
+  mother's; it does not say how large the inheritance is. For that, read the estimate, keeping in mind its
+  compression toward the middle of the scale.
+
+# Where to go next
+
+| To do | Look at |
+|---|---|
+| choose the smoothing level and penalty yourself | `tune_prnode()`, `tune_prnode_spar()`, `lambda_max_prnode()` |
+| build or inspect the design directly | `make_prnode_design()`, `make_integrated_basis()`, `profile_cell()` |
+| use a polynomial truth and design, $q > 1$ | the `q` arguments of `sim_md_network()`, `build_md_dataset()`, `fit_prnode()`, `inheritance_test()` |
+| change the multipliers of the three penalty blocks | the `mu` argument of `fit_prnode()` |
+| control the solver and its output | `fit_prnode_path()`, `verbose`, `tol`, `max_iter` |
+
+```{r session}
+sessionInfo()
+```

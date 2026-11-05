@@ -1,0 +1,42 @@
+Package: LICmethods
+Type: Package
+Title: Protein Regulatory Networks of Mother-Daughter Cell Pairs from Live-Cell Imaging
+Version: 0.13.0
+Authors@R: c(
+    person("Shirley", "Mathur", role = c("aut", "cre"), email = "shirmath@uw.edu"),
+    person("Kevin", "Lin", role = "aut", email = "kzlin@uw.edu")
+  )
+Description: Jointly estimates the ordinary-differential-equation regulatory
+    networks of a mother yeast cell and one of her daughters from live-cell
+    time-lapse trajectories (PRNODE). Each protein's rate equation is fit as a
+    three-block group lasso on integrated polynomial bases: a scaffold shared by
+    the two cells plus a deviation per cell, with per-cell intercept and slope
+    profiled out and one common inverse-variance loss weight; the smoothing
+    level and the penalty are chosen together by a known-variance BIC. Includes the simulators the
+    method is tested on (a scaffold-plus-deviation network generator with every
+    edge type, an exact linear-ODE solver, a dataset builder whose truth carries
+    the pair's true inheritance), an inheritance measure (the one-frame flow-map similarity
+    of the two fitted systems in standardized units at the tuned penalty) with its
+    wrong-mother permutation test, edge-type scoring and plotting.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Depends:
+    R (>= 4.1)
+Imports:
+    graphics,
+    grDevices,
+    Matrix,
+    stats
+Suggests:
+    deSolve,
+    glmnet,
+    igraph,
+    knitr,
+    methods,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    withr
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.1

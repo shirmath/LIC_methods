@@ -1,0 +1,12 @@
+.Rhistory
+.Rapp.history
+.RData
+.RDataTmp
+.Ruserdata
+.Rproj.user/
+*-Ex.R
+/*.tar.gz
+/*.Rcheck/
+.DS_Store
+vignettes/*.html
+Rplots.pdf
